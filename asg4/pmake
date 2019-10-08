@@ -1,0 +1,356 @@
+#!/usr/bin/perl -w
+# Wai Chun Leung, wleung11@ucsc.edu
+use strict;
+use warnings;
+use Getopt::Std;
+
+my %strsignal = (
+    1 => "Hangup",
+    2 => "Interrupt",
+    3 => "Quit",
+    4 => "Illegal instruction",
+    5 => "Trace/breakpoint trap",
+    6 => "Aborted",
+    7 => "Bus error",
+    8 => "Floating point exception",
+    9 => "Killed",
+   11 => "Segmentation fault",
+   13 => "Broken pipe",
+   14 => "Alarm clock",
+   15 => "Terminated",
+   16 => "Stack fault",
+   17 => "Child exited",
+   18 => "Continued",
+   19 => "Stopped (signal)",
+   20 => "Stopped",
+   21 => "Stopped (tty input)",
+   22 => "Stopped (tty output)",
+   24 => "CPU time limit exceeded",
+   25 => "File size limit exceeded",
+   26 => "Virtual timer expired",
+   27 => "Profiling timer expired",
+   28 => "Window changed",
+   29 => "I/O possible",
+   30 => "Power failure",
+   31 => "Bad system call",
+);
+
+# Global Hashes:
+my %macros_hash;
+my %prereqs_hash;
+my %commands_hash;
+my %targetln_hash;
+my %wildcard_hash;
+
+# ------------------------- #
+# -- PARSING SUBROUTINES -- #
+# ------------------------- #
+
+# Replaces all macros with its respective value
+# Uses tail recursion to replace nested macros
+sub replace_macros {
+    my ($str) = @_;
+    # Replace all double $$ signs
+    if ($str =~ m/\$\$/) {
+        $str =~ s/\$\$/\$/g;
+    }
+    # Replacing Macros
+    if ($str =~ m/\${(\S+)}/) {
+        $str =~ s/\${(\S+)}/@{$macros_hash{$1}}/g;
+    } else {
+        return $str;
+    }
+    return replace_macros($str);
+}
+
+# Code referenced from graph.perl
+sub parse_dep ($) {
+    my ($line) = @_;
+    return undef unless $line =~ m/^(\S+)\s*:\s*(.*?)\s*$/;
+    my ($target, $dependency) = ($1, $2);
+    $dependency = replace_macros($dependency);
+    $target = replace_macros($target);
+    my @dependencies = split m/\s+/, $dependency;
+    return $target, \@dependencies;
+}
+
+# Code referenced from graph.perl
+sub parse_macro ($) {
+    my ($line) = @_;
+    return undef unless $line =~ m/^(\S+)\s*=\s*(.*?)\s*$/;
+    my ($macro, $vars) = ($1, $2);
+    $vars = replace_macros($vars);
+    my @variables = split m/\s+/, $vars;
+    return $macro, \@variables;
+}
+
+# Code from mtime.perl
+sub mtime ($) {
+   my ($filename) = @_;
+   my @stat = stat $filename;
+   return @stat ? $stat[9] : undef;
+}
+
+# ---------------------- #
+# -- MAKEFILE PARSING -- #
+# ---------------------- #
+
+# Analyze options using getopts
+my %opts;
+getopts ("d", \%opts);
+print("-- DEBUG OPTION ENABLED -- \n") if $opts{'d'};
+
+# Open filestream for reading
+my $filename = "./Makefile";
+# Program exits if Makefile not found or unopenable
+open my $infile, "<$filename" or die "<$filename: $!\n" and next;       
+
+# Pre variables
+my $linecount = 2; # Keep line number for targets
+my $firsttarget; # Keep the first target occurence for later
+my $toptarget = "error"; #error should not appear in any hashes
+my $lastempty = 0;
+my $thisempty;
+while (defined (my $line = <$infile>)) { #Parse starts
+    #Remove newline char
+    chomp $line;
+
+    #Skipping comment/empty lines
+    next if $line =~ m/^\s*#/;
+    $thisempty = $line =~ m/^\s*$/; 
+    next if $lastempty and $thisempty; 
+
+    $linecount++;
+    #Check if line is macros
+    my ($macro, $vars) = parse_macro $line;
+    if (defined $macro) {
+        #Add macro as key and vars as value to hash
+        $macros_hash{$macro} = $vars;
+        next;
+    }
+
+    #Check if line is target:prereq
+    my ($target, $deps) = parse_dep $line;
+    if (defined $target) {
+        if (!defined $firsttarget && !@ARGV) {
+            #Save the first target ever encountered
+            $firsttarget = $target;
+        }
+        #Save the most recent target for commands
+        $toptarget = $target;
+        #Add target as key and deps as value to hash
+        $prereqs_hash{$target} = $deps;
+        #Save linecount at target
+        $targetln_hash{$target} = $linecount;
+        #Check if target is wildcard
+        if ($target =~ m/^\s*%/) {
+            $target =~ s/^\s*%//g;
+            $_ =~ s/^\s*%//g for (@$deps);
+            $wildcard_hash{$target} = $deps;
+        }
+        next;
+    }
+
+    #Check if line is a command
+    if ($line =~ m/^\s*\t\S+/) {
+        #If key exists, push line to existing stack
+        $line = replace_macros($line);
+        if (exists $commands_hash{$toptarget}) {
+            push($commands_hash{$toptarget}, $line);
+        } else { #If not, make a new stack and add to hash
+            my @temp;
+            push(@temp, $line);
+            $commands_hash{$toptarget} = \@temp;
+        }
+        next;
+    }
+
+    #Print any unparsed lines:
+    # printf("%s\n", $line) if $opts{'d'};
+}continue {
+    $lastempty = $thisempty;
+};
+# Parse stops, close file
+close $infile;
+
+# -------------------- #
+# -- DEBUGGING ONLY -- #
+# -------------------- #
+
+if ($opts{'d'}) {
+    #Printing hash tables
+    print("\t-- macros_hash -- \n");
+    for my $key (keys %macros_hash) {
+        printf(":: %s ---> ", $key);
+        print "$_ " for (@{$macros_hash{$key}});
+        print("\n");
+    }
+    print("\t-- prereqs_hash -- \n");
+    for my $key (keys %prereqs_hash) {
+        printf(":: %s ---> ", $key);
+        print "$_ " for (@{$prereqs_hash{$key}});
+        print("\n");
+    }
+    print("\t-- targetln_hash -- \n");
+    for my $key (keys %targetln_hash) {
+        printf(":: %s ---> ", $key);
+        printf("%s ", $targetln_hash{$key});
+        print("\n");
+    }
+    print("\t-- commands_hash -- \n");
+    for my $key (keys %commands_hash) {
+        printf(":: %s ---> \n", $key);
+        print "$_ \n" for (@{$commands_hash{$key}});
+        print("\n");
+    }
+    print("\t-- wildcard_hash -- \n");
+    for my $key (keys %wildcard_hash) {
+        printf(":: %s ---> ", $key);
+        print "$_ " for (@{$wildcard_hash{$key}});
+        print("\n");
+    }
+    print("\t-- arg debug -- \n");
+
+    #DEBUG: Detect if any arguments are presented
+    if (@ARGV) {
+        my $count = 0;
+        foreach my $arg(@ARGV) {
+            print("ARGV[$count] = $arg \n");
+            $count++;
+        }
+    } else {
+        printf("No args, first target: %s\n", $firsttarget);
+    }
+}
+
+# --------------------------- #
+# -- EXECUTION SUBROUTINES -- #
+# --------------------------- #
+
+# Call all commands under the given target using system()
+sub exec_commands {
+    my ($tar, $cons) = @_;
+    if (exists $commands_hash{$tar}) {
+        printf("executing target %s\n", $tar) if ($opts{'d'});
+        for (@{$commands_hash{$tar}}) {
+            my $cmd = $_;
+            my $ignore = 0;
+            # Remove tab
+            $cmd =~ s/^\s*\t//g;
+
+            # Wildcard symbol "$<" is substituted
+            if ($cmd =~ m/\$</) {
+                $cmd =~ s/\$</$cons/;
+                print "FIXED: $cmd\n" if ($opts{'d'});
+            }
+            # Command prefix parsing
+            if ($cmd =~ m/^\s*@/) { # Prefix "@" command
+                # Remove @ , do not print
+                $cmd =~ s/^\s*@\s*//g;
+            } elsif ($cmd =~ m/^\s*-/) { # Prefix "-" command
+                # Remove - and print
+                $cmd =~ s/^\s*-\s*//g;
+                printf("%s\n", $cmd); 
+                $ignore = 1;
+            } else { #Print command to stdout otherwise
+                printf("%s\n", $cmd); 
+            }
+
+            # Finally run command
+            system($cmd);
+            # Error Checking:
+            my $term_signal = $? & 0x7F;
+            my $exit_status = ($? >> 8) & 0xFF;
+            # If an error occurs, determine if ignoring or not
+            if ($term_signal != 0 || $exit_status != 0) {
+                my $ln = $targetln_hash{$tar};
+                print("make: ");
+                print("*** ") if ($ignore == 0);
+                print("[Makefile:$ln: $tar] Error $exit_status");
+                print(" (ignored)") if ($ignore == 1);
+                print("\n");
+                exit(-1) if ($ignore == 0);
+            }
+        }
+    }
+}
+
+# Call exec_commands while passing in the consistent var
+sub exec_wildcard {
+    my ($key, $name) = @_;
+    my $sub; # The extension wanted is set to this
+    $sub = $_ for (@{$wildcard_hash{$key}});
+    # Set name to the wanted file with the correct extension
+    $name =~ s/(\.[^.]+)$/$sub/g;
+    # Append the % back to the front of the key
+    $key = "%$key";
+    # Call exec_commands with the fixed key and name
+    exec_commands($key, $name);
+}
+
+# If a given target has dependencies, recursively call exec_target()
+# then execute the commands of the target by calling exec_commands()
+sub exec_target {
+    my ($tar) = @_;
+
+    printf("in target %s\n", $tar) if ($opts{'d'});
+    # For all dependencies, check is obsolete or not
+    # Deal with non-obsolete targets and check
+    # with wildcard hash. Calls exec_commands().
+    for my $dep(@{$prereqs_hash{$tar}}) {
+        if (-e $tar && -e $dep) { # Both are files
+            # Check if target file is newer than prereq,
+            # if it is, exit, else do nothing.
+            my $target_time = mtime $tar;
+            my $dep_time = mtime $dep;
+            if ($target_time >= $dep_time) {
+                printf("make: '%s' is up to date.\n", $tar);
+                exit(0);
+            }
+        } else { # Either target or dep is a file, or none
+            # Check if dep is a target elsewhere
+            if (exists $targetln_hash{$dep}) {
+                exec_target($dep);
+            }
+            # Check if dep matches a wildcard
+            my $iswildcard = 0;
+            for my $key (keys %wildcard_hash) {
+                my ($ext) = $dep =~ m/(\.[^.]+)$/;
+                # print "->$ext\n";
+                if ($ext and $ext eq $key) {
+                    $iswildcard = 1;
+                    exec_wildcard($key, $dep);
+                }
+            }
+            # If dep is not a file, wildcard, or target, error
+            if ($iswildcard == 0 
+                    && !(-e $dep) 
+                    && !(exists $targetln_hash{$dep})) {
+                print("make: *** No rule to make target ");
+                printf("'%s', needed by '%s'.  Stop.\n", $dep, $tar);
+                exit(1);
+            }
+        }
+    } #Dep loop ends
+
+    # Execute the commands of this target since all dependencies
+    # have been dealth with and the program has not exited
+    exec_commands($tar);
+    # After execution, remove target from hash table
+    # So it wont get called again later
+    delete($commands_hash{$tar});
+}
+
+# --------------------- #
+# -- COMMAND CALLING -- #
+# --------------------- #
+
+# If there exists arguments, execute them in the order they are written.
+# If there are no args, execute the first target that occured
+if (@ARGV) {
+    foreach my $arg(@ARGV) {
+        exec_target($arg);
+    }
+} else {
+    exec_target($firsttarget);
+}
